@@ -10,7 +10,7 @@
 
 local MODE = ...
 
-local VERSION = "0.2.0"
+local VERSION = "0.2.0-otio.2"
 local BRIDGE = "resolve_mcp_bridge v" .. VERSION
 local STATE_DIR_STAMP = [==[@@RLB_STATE_DIR@@]==] -- server-stamped at copy time; long bracket: quotes are safe
 local PREFIX = "Global.ResolveLuaBridge."
@@ -310,7 +310,37 @@ end
 
 -- loadfile + call under pcall, in an empty environment: a request is `return { ... }` and
 -- needs no globals, so a tampered file cannot reach _G. Returns the table or nil, error.
-local function load_request(path)
+-- Fork: Resolve 21.1.2 removed loadfile from the Scripts-menu Lua; the server also writes the
+-- request as next.otio, a timeline whose "REQ" marker note holds the same `return { ... }` text.
+local function read_otio_request(path, R)
+  local pj = R:GetProjectManager():GetCurrentProject()
+  if not pj then return nil, "no project open" end
+  local mp = pj:GetMediaPool()
+  local prev = pj:GetCurrentTimeline()
+  local okt, tl = pcall(function() return mp:ImportTimelineFromFile(path, { timelineName = "__claude_req__" }) end)
+  if not okt or not tl then return nil, "ImportTimelineFromFile failed: " .. tos(tl) end
+  local note
+  pcall(function()
+    for _, m in pairs(tl:GetMarkers()) do if m.name == "REQ" then note = m.note end end
+  end)
+  pcall(function() mp:DeleteTimelines({ tl }) end)
+  if prev then pcall(function() pj:SetCurrentTimeline(prev) end) end
+  if type(note) ~= "string" then return nil, "no REQ marker in " .. path end
+  return note
+end
+
+local function load_request(path, R)
+  if path:sub(-5) == ".otio" then
+    local text, terr = read_otio_request(path, R)
+    if not text then return nil, terr end
+    local chunk, lerr = loadstring(text, "=request")
+    if type(chunk) ~= "function" then return nil, "loadstring: " .. tos(lerr) end
+    pcall(setfenv, chunk, {})
+    local okc, req = pcall(chunk)
+    if not okc then return nil, "request chunk error: " .. tos(req) end
+    if type(req) ~= "table" then return nil, "request did not return a table (" .. type(req) .. ")" end
+    return req
+  end
   local okl, chunk, lerr = pcall(loadfile, path)
   if not okl then return nil, "loadfile threw: " .. tos(chunk) end
   if type(chunk) ~= "function" then return nil, "loadfile: " .. tos(lerr) end
@@ -393,11 +423,53 @@ local function set_pref(st, key, value)
   return true
 end
 
+-- Mailbox (fork angelloor): Resolve 21.1.2 keeps prefs in memory and writes Fusion.prefs only on
+-- quit, and the Scripts-menu sandbox blocks io.open, createdir and ExportMetadata (all measured
+-- 2026-10-28). Timeline:Export still writes: every save also copies RLBResp and RLBSession into the
+-- note of an "RLB" marker on a helper timeline and exports it as OTIO (64 KB note measured, ~2 ms).
+local MAILBOX_TIMELINE = "__claude_bridge__"
+
+local function mailbox_timeline(st)
+  local pm = st.resolve and st.resolve:GetProjectManager()
+  local pj = pm and pm:GetCurrentProject()
+  if not pj then return nil end
+  for i = 1, pj:GetTimelineCount() do
+    local t = pj:GetTimelineByIndex(i)
+    if t and t:GetName() == MAILBOX_TIMELINE then return t end
+  end
+  local prev = pj:GetCurrentTimeline()
+  local t = pj:GetMediaPool():CreateEmptyTimeline(MAILBOX_TIMELINE)
+  if not t then return nil end
+  pj:SetCurrentTimeline(t)
+  t:InsertGeneratorIntoTimeline("Solid Color")   -- markers need a timeline with length
+  if prev then pj:SetCurrentTimeline(prev) end
+  return t
+end
+
+local function mailbox_flush(st)
+  return pcall(function()
+    local t = mailbox_timeline(st)
+    if not t then return false end
+    local lines = {}
+    for _, key in ipairs({ "RLBSession", "RLBResp" }) do
+      local v = st.fusion:GetPrefs(PREFIX .. key)
+      if type(v) == "string" then lines[#lines + 1] = key .. ' = "' .. v .. '"' end
+    end
+    t:DeleteMarkerAtFrame(1)
+    t:AddMarker(1, "Blue", "RLB", table.concat(lines, "\n"), 1, "")
+    return t:Export(st.state_dir .. "/mailbox.otio", st.resolve.EXPORT_OTIO, st.resolve.EXPORT_NONE)
+  end)
+end
+
 -- SavePrefs returns nil on success; a throw or an explicit false is a failure. Resolve may be
 -- writing the file itself, so retry a few times.
 local function save_prefs(st)
   local F = st.fusion
   local t0 = now()
+  local mok, mret = false, nil
+  if st.state_dir then mok, mret = mailbox_flush(st) end
+  if not mok then st.last_error = "mailbox: " .. tos(mret) end
+  local mailed = mok and mret == true
   local last
   for attempt = 1, SAVE_RETRIES do
     local ok, ret = pcall(function() return F:SavePrefs() end)
@@ -405,6 +477,7 @@ local function save_prefs(st)
     last = ok and "returned false" or tos(ret)
     wait(0.05)
   end
+  if mailed then return true, SAVE_RETRIES, ms_since(t0), "prefs not saved; mailbox written" end
   return false, SAVE_RETRIES, ms_since(t0), last
 end
 
@@ -500,6 +573,18 @@ local function start(opts)
   if st.resolve == nil then st.resolve, st.resolve_source = acquire_resolve() end
   st.fusion, st.fusion_source = opts.fusion, "opts"
   if st.fusion == nil then st.fusion, st.fusion_source = acquire_fusion(st.resolve) end
+  if st.fusion == nil and not opts.no_shim and st.resolve ~= nil then
+    -- Fork: no Fusion object in this Lua state (seen on 21.1.2); keep the prefs keys in memory,
+    -- the mailbox carries them out.
+    local store = {}
+    st.fusion = {
+      SetPrefs = function(_, k, v) store[k] = v; return true end,
+      GetPrefs = function(_, k) return store[k] end,
+      SavePrefs = function() return false end,
+      MapPath = function() error("no fusion") end,
+    }
+    st.fusion_source = "mailbox shim (" .. tos(st.fusion_source) .. ")"
+  end
   if st.fusion == nil then return nil, st.fusion_source end
   st.pid = tonumber(bmd_call("getpid")) or -1
   local uuid = bmd_call("createuuid")
@@ -525,9 +610,9 @@ local function start(opts)
     save_prefs(st)
     return nil, fatal
   end
-  st.req_path = st.state_dir .. "/next.lua"
+  st.req_path = st.state_dir .. (type(loadfile) == "function" and "/next.lua" or "/next.otio")
   if file_exists(st.req_path) then
-    local req = load_request(st.req_path)
+    local req = load_request(st.req_path, st.resolve)
     if type(req) == "table" and valid_id(req.id) then st.last_id = req.id
     else st.bad_until = now() + BAD_FILE_BACKOFF_S end
   end
@@ -555,8 +640,12 @@ local function run_loop(st, max_ticks, tick)
       st.start_save.retries = (st.start_save.retries or 0) + 1
       if not st.session_saved then st.session_retry_at = now() + 1 end
     end
-    if file_exists(st.req_path) and now() >= st.bad_until then
-      local req, lerr = load_request(st.req_path)
+    local otio = st.req_path:sub(-5) == ".otio"
+    if otio and not file_exists(st.req_path) then st.seen_until = 0 end
+    -- An OTIO import costs ~160 ms: once a request file is read, re-read it at most every 0.3 s.
+    if file_exists(st.req_path) and now() >= st.bad_until and (not otio or now() >= (st.seen_until or 0)) then
+      if otio then st.seen_until = now() + 0.3 end
+      local req, lerr = load_request(st.req_path, st.resolve)
       if req == nil or not valid_id(req.id) then
         if file_exists(st.req_path) then   -- still there: unreadable, not just deleted by the server
           st.bad_until = now() + BAD_FILE_BACKOFF_S

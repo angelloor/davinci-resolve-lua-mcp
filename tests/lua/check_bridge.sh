@@ -31,7 +31,7 @@ n=$(printf '%s\n' "$clean" | grep -cE "$PATTERN")
 [ "$n" = 0 ] || bad "self-test: the forbidden-call pattern matched $n allowed sample lines"
 
 lines=$(wc -l < "$F" | tr -d ' ')
-[ "$lines" -lt 600 ] || bad "$lines lines (limit 600)"
+[ "$lines" -lt 700 ] || bad "$lines lines (limit 700; fork: +OTIO mailbox)"
 
 sed -n 1p "$F" | grep -Eq '^-- resolve_mcp_bridge v[0-9]+\.[0-9]+\.[0-9]+$' || bad "line 1 is not the version header"
 [ "$(sed -n 2p "$F")" = "-- RLB_STATE_DIR=@@RLB_STATE_DIR@@" ] || bad "line 2 is not the state-dir stamp"
@@ -48,7 +48,7 @@ $hits"
 count() { printf '%s\n' "$code" | grep -c "$1"; }
 n=$(count ':SavePrefs('); [ "$n" = 1 ] || bad "expected exactly 1 SavePrefs call site, found $n"
 n=$(count ':SetPrefs('); [ "$n" = 1 ] || bad "expected exactly 1 SetPrefs call site, found $n"
-n=$(count ':GetPrefs('); [ "$n" = 1 ] || bad "expected exactly 1 GetPrefs call site (the stop guard), found $n"
+n=$(count ':GetPrefs('); [ "$n" = 2 ] || bad "expected exactly 2 GetPrefs call sites (the stop guard and the mailbox), found $n"
 
 if [ "$fail" = 0 ]; then
   printf 'check_bridge: OK (%s lines, headers, stamp, no forbidden calls, one SetPrefs/SavePrefs/GetPrefs)\n' "$lines"

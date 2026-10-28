@@ -590,8 +590,10 @@ af, afsrc = M.acquire_fusion(nil)
 check("none", af == nil, afsrc)
 FU.saves = 0
 local lonely = obj("Resolve", { GetProductName = function() return "DaVinci Resolve" end, Fusion = function() return nil end })
-local st_nf, err_nf = M.start({ resolve = lonely, state_dir = STATE })
+local st_nf, err_nf = M.start({ resolve = lonely, state_dir = STATE, no_shim = true })
 check("start without fusion returns nil, no save", st_nf == nil and FU.saves == 0, err_nf)
+local st_sh = M.start({ resolve = lonely, state_dir = STATE })
+check("fork: start without fusion uses the mailbox shim", st_sh ~= nil and tostring(st_sh.fusion_source):find("mailbox shim", 1, true) ~= nil and FU.saves == 0, st_sh and st_sh.fusion_source)
 rawset(_G, "fusion", fusion_stub)
 
 ---------------------------------------------------------------------------

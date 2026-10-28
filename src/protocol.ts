@@ -8,6 +8,7 @@ import { setTimeout as sleepFor } from 'node:timers/promises';
 import type { Logger } from './log.js';
 import { silentLogger } from './log.js';
 import { formatRequest, SESSION_RE, type RequestOp } from './lua.js';
+import { formatRequestOtio, REQUEST_OTIO_FILE } from './requestOtio.js';
 import {
   extractResp,
   extractSessionHex,
@@ -233,12 +234,38 @@ function sameKey(a: PollKey | undefined, b: PollKey): boolean {
   return a !== undefined && a.ino === b.ino && a.size === b.size && a.mtimeMs === b.mtimeMs;
 }
 
+const MAILBOX_FILE = 'mailbox.otio';
+
+/** Combined key of Fusion.prefs and the OTIO mailbox: a change in either counts. */
+async function channelKey(prefsPath: string, mailboxPath: string): Promise<PollKey | undefined> {
+  let a: fs.Stats | undefined;
+  let b: fs.Stats | undefined;
+  try {
+    a = await fsp.stat(prefsPath);
+  } catch {
+    a = undefined; // mid-rename; try again next tick
+  }
+  try {
+    b = await fsp.stat(mailboxPath);
+  } catch {
+    b = undefined;
+  }
+  if (!a && !b) return undefined;
+  const ka = a ? pollKey(a) : { ino: 0, size: 0, mtimeMs: 0 };
+  const kb = b ? pollKey(b) : { ino: 0, size: 0, mtimeMs: 0 };
+  return { ino: ka.ino * 31 + kb.ino, size: ka.size * 1_000_003 + kb.size, mtimeMs: ka.mtimeMs + kb.mtimeMs * 3 };
+}
+
 export class BridgeClient implements Bridge {
   readonly stateDir: string;
   readonly prefsDir: string;
   readonly lockPath: string;
   readonly requestPath: string;
   private readonly tmpPath: string;
+  /** OTIO mailbox the fork's bridge exports when Resolve does not save Fusion.prefs (21.1.2). */
+  readonly mailboxPath: string;
+  /** Same request as an OTIO timeline, for bridges without loadfile (Resolve 21.1.2). */
+  readonly otioRequestPath: string;
   private readonly maxResponseKb: number;
   private readonly log: Logger;
   private readonly pollMs: number;
@@ -261,6 +288,8 @@ export class BridgeClient implements Bridge {
     this.lockPath = path.join(opts.stateDir, LOCK_FILE);
     this.requestPath = path.join(opts.stateDir, REQUEST_FILE);
     this.tmpPath = path.join(opts.stateDir, REQUEST_TMP_FILE);
+    this.mailboxPath = path.join(opts.stateDir, MAILBOX_FILE);
+    this.otioRequestPath = path.join(opts.stateDir, REQUEST_OTIO_FILE);
     this.maxResponseKb = opts.maxResponseKb;
     this.log = opts.logger ?? silentLogger;
     this.pollMs = opts.pollMs ?? 25;
@@ -641,18 +670,13 @@ export class BridgeClient implements Bridge {
   /** The request/response exchange proper; the caller holds the lock and releases it afterwards. */
   private async exchange(op: RequestOp, opts: RequestOptions, entry: number, report: BridgeRequestReport): Promise<Envelope> {
     const prefs = await this.locatePrefs();
-    const text = await this.readText(prefs.path);
+    const text = await this.readChannel(prefs.path);
     // Read fresh every time: a stale session id sent to a live bridge makes that bridge exit.
     const session = this.requireRunning(this.readSession(text), op);
 
     // Baseline before the request exists: a bridge tick plus a 1 to 6 ms save can land before a
     // baseline taken afterwards, which would hide the response until an unrelated save.
-    let last: PollKey | undefined;
-    try {
-      last = pollKey(await fsp.stat(prefs.path));
-    } catch {
-      last = undefined;
-    }
+    let last: PollKey | undefined = await channelKey(prefs.path, this.mailboxPath);
 
     const id = randomUUID().replace(/-/g, '');
     const body = formatRequest({
@@ -667,6 +691,9 @@ export class BridgeClient implements Bridge {
       await fsp.writeFile(this.tmpPath, body, 'utf8');
       // A leftover next.lua the bridge has open makes the rename-over fail on Windows for a few ms.
       await retryTransient(() => this.fs.rename(this.tmpPath, this.requestPath), { sleep: this.sleep });
+      const otioTmp = `${this.otioRequestPath}.tmp`;
+      await fsp.writeFile(otioTmp, formatRequestOtio(body), 'utf8');
+      await fsp.rename(otioTmp, this.otioRequestPath); // fork: macOS only, outside the injected fs
     } catch (err) {
       await fsp.unlink(this.tmpPath).catch(() => undefined);
       throw new BridgeError(
@@ -688,17 +715,11 @@ export class BridgeClient implements Bridge {
         await this.sleep(this.pollMs);
         polls += 1;
         report.polls = polls;
-        let st: fs.Stats | undefined;
-        try {
-          st = await fsp.stat(prefs.path);
-        } catch {
-          st = undefined; // mid-rename; try again next tick
-        }
-        const key = st ? pollKey(st) : undefined;
+        const key = await channelKey(prefs.path, this.mailboxPath);
         const changed = key !== undefined && !sameKey(last, key);
         if (changed || polls % FORCED_READ_EVERY === 0) {
           if (key) last = key;
-          const resp = extractResp(await this.readText(prefs.path));
+          const resp = extractResp(await this.readChannel(prefs.path));
           if (resp && resp.id === id) {
             let env: Envelope;
             try {
@@ -730,6 +751,7 @@ export class BridgeClient implements Bridge {
     } finally {
       // The bridge cannot delete files; a slot that stays occupied is never re-run (same id). Windows
       // may refuse the delete for a few ms while the bridge's loadfile holds the file: retried, then logged.
+      await fsp.unlink(this.otioRequestPath).catch(() => undefined);
       try {
         await retryTransient(() => this.fs.unlink(this.requestPath), { sleep: this.sleep });
       } catch (err) {
@@ -738,6 +760,18 @@ export class BridgeClient implements Bridge {
         }
       }
     }
+  }
+
+  /** Fusion.prefs followed by the mailbox lines, so the mailbox wins (lastMatch) when both exist. */
+  private async readChannel(prefsPath: string): Promise<string> {
+    const prefs = await this.readText(prefsPath);
+    let otio = '';
+    try {
+      otio = await fsp.readFile(this.mailboxPath, 'utf8');
+    } catch {
+      return prefs;
+    }
+    return `${prefs}\n${mailboxLines(otio)}`;
   }
 
   private async readText(p: string): Promise<string> {
@@ -762,7 +796,7 @@ export class BridgeClient implements Bridge {
       const prefs = await this.locatePrefs();
       out.prefs_file = prefs.path;
       out.prefs_mtime = new Date(prefs.mtimeMs).toISOString();
-      const text = await this.readText(prefs.path);
+      const text = await this.readChannel(prefs.path);
       const session = this.readSession(text);
       if (session) {
         out.session = session;
@@ -819,4 +853,30 @@ function kindToReason(kind: BridgeErrorKind): StatusReason {
     case 'io_error':
       return 'bridge_error';
   }
+}
+
+/** The note of every "RLB" marker in an OTIO export; '' while the file is half written. */
+export function mailboxLines(otioText: string): string {
+  let doc: unknown;
+  try {
+    doc = JSON.parse(otioText);
+  } catch {
+    return '';
+  }
+  const out: string[] = [];
+  const walk = (o: unknown): void => {
+    if (Array.isArray(o)) {
+      for (const v of o) walk(v);
+    } else if (o && typeof o === 'object') {
+      const rec = o as Record<string, unknown>;
+      if (typeof rec.OTIO_SCHEMA === 'string' && rec.OTIO_SCHEMA.startsWith('Marker') && rec.name === 'RLB') {
+        const md = rec.metadata as { Resolve_OTIO?: { Note?: unknown } } | undefined;
+        const note = md?.Resolve_OTIO?.Note;
+        if (typeof note === 'string') out.push(note);
+      }
+      for (const v of Object.values(rec)) walk(v);
+    }
+  };
+  walk(doc);
+  return out.join('\n');
 }
